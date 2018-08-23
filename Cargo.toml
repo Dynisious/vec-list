@@ -1,0 +1,11 @@
+[package]
+name = "vec-list"
+version = "0.1.0"
+authors = ["Dynisious <daniel.bechaz@gmail.com>"]
+
+[features]
+try_reserve = []
+shrink_to = []
+drain_filter = []
+
+[dependencies]
