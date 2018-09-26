@@ -4,10 +4,12 @@ mod iter_mut;
 mod drain;
 mod drain_filter;
 
-pub use self::iter::*;
-pub use self::iter_mut::*;
-pub use self::drain::*;
-pub use self::drain_filter::*;
+pub use self::{
+    iter::*,
+    iter_mut::*,
+    drain::*,
+    drain_filter::*,
+};
 
 #[macro_export]
 macro_rules! node_err {

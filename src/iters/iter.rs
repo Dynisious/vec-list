@@ -6,14 +6,23 @@ macro_rules! list {
     ($ptr:expr) => (unsafe { &*$ptr });
 }
 
+/// Creates a new `Iter` from parts.
+/// 
+/// # Params
+/// 
+/// list --- The `VecList` to iterate over.  
+/// ends --- The ends of the `VecList` to iterate over.
 #[inline]
-pub const fn new_iter<'t, T: 't,>(list: &'t VecList<T,>, ends: Option<(usize, usize,)>,) -> Iter<'t, T,> {
+pub fn new_iter<'t, T: 't,>(list: &'t VecList<T,>, ends: Option<(usize, usize,)>,) -> Iter<'t, T,> {
     Iter { list, ends, }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone,)]
+/// A mutable iterator over a `VecList`.
+#[derive(PartialEq, Eq, PartialOrd, Ord,)]
 pub struct Iter<'t, T: 't,> {
+    /// The `VecList` to iterate over.
     list: *const VecList<'t, T,>,
+    /// The ends to iterate over.
     ends: Option<(usize, usize,)>,
 }
 
@@ -23,22 +32,26 @@ impl<'t, T: 't,> Iterator for Iter<'t, T,> {
     fn next(&mut self) -> Option<Self::Item,> {
         use imply_option::*;
 
-        let list = list!(self.list);
-
         self.ends.map(|(node, tail,)| {
-            self.ends = list.nodes[node].next
+            //Advance the ends.
+            self.ends = list!(self.list).nodes[node].next
+                //If the `Node` is the tail pointer while iterating forward, this is the last value.
                 .and_then(|next| (node != tail).then((next, tail,)));
             
-            &*list.nodes[node].value
+            &*list!(self.list).nodes[node].value
         })
     }
     fn size_hint(&self) -> (usize, Option<usize,>,) {
+        //Calculate the number of `Node`s.
         let len = match self.ends {
+            //If there are no ends, there are no values.
             None => 0,
             Some((mut node, tail,)) => {
                 let list = list!(self.list);
+                //If there are ends there is at least 1 value.
                 let mut count = 1;
 
+                //Count the remaining values.
                 while node != tail {
                     count += 1;
                     node = list.nodes[node].next
@@ -56,14 +69,14 @@ impl<'t, T: 't,> Iterator for Iter<'t, T,> {
 impl<'t, T: 't,> DoubleEndedIterator for Iter<'t, T,> {
     fn next_back(&mut self) -> Option<Self::Item,> {
         use imply_option::*;
-        
-        let list = list!(self.list);
-        
+
         self.ends.map(|(head, node,)| {
-            self.ends = list.nodes[node].prev
+            //Advance the ends.
+            self.ends = list!(self.list).nodes[node].prev
+                //If the `Node` is the head pointer while iterating backward, this is the last value.
                 .and_then(|prev| (node != head).then((head, prev,)));
             
-            &*list.nodes[node].value
+            &*list!(self.list).nodes[node].value
         })
     }
 }

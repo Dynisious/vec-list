@@ -2,54 +2,73 @@
 use ::*;
 use std::{
     cmp::{PartialEq, PartialOrd, Ord, Ordering,},
-    ops::Deref, convert::AsRef, borrow::Borrow,
+    ops::Deref,
+    convert::AsRef,
+    borrow::Borrow,
 };
 
-macro_rules! make_ref {
+macro_rules! list {
     ($ptr:expr) => (unsafe { &*$ptr });
 }
 
+/// Creates a new `View` value from parts.
+/// 
+/// # Params
+/// 
+/// list --- The `VecList` to iterate over.  
+/// view --- The index in the `VecList` to view.
 #[inline]
-pub const fn new_view<'i, 't: 'i, T: 't,>(list: &'i VecList<'t, T,>, view: &'i Node<'t, T,>,) -> View<'i, T,> {
+pub fn new_view<'i, 't: 'i, T: 't,>(list: &'i VecList<'t, T,>, view: usize,) -> View<'i, T,> {
     View { list, view, }
 }
 
-#[derive(Eq, Clone, Debug,)]
+#[derive(Eq, Debug,)]
 pub struct View<'t, T: 't,> {
+    /// The `VecList` to iterate over.
     list: *const VecList<'t, T,>,
-    view: *const Node<'t, T,>,
+    /// The postion to view at.
+    view: usize,
 }
 
 impl<'t, T: 't,> View<'t, T,> {
+    /// Creates a `View` at the next position in the `VecList`.
     pub fn next(&self) -> Option<Self,> {
-        make_ref!(self.view).next.map(
-            |next| new_view(make_ref!(self.list), &make_ref!(self.list).nodes[next],)
-        )
+        let list = list!(self.list);
+
+        list.nodes[self.view].next
+            .map(|next| new_view(list, next,))
     }
+    /// Creates a `View` at the previous position in the `VecList`.
     pub fn prev(&self) -> Option<Self,> {
-        make_ref!(self.view).prev.map(
-            |prev| new_view(make_ref!(self.list), &make_ref!(self.list).nodes[prev],)
-        )
+        let list = list!(self.list);
+
+        list.nodes[self.view].prev
+            .map(|prev| new_view(list, prev,))
     }
+    /// Convert this `View` into a reference to the value.
     #[inline]
-    pub fn as_ref(self) -> &'t T { &make_ref!(self.view).value }
+    pub fn as_ref(self) -> &'t T {
+        &list!(self.list).nodes[self.view].value
+    }
 }
 
 impl<'t, T: 't,> Deref for View<'t, T,> {
     type Target = T;
 
     #[inline]
-    fn deref(&self) -> &Self::Target { &make_ref!(self.view).value }
+    fn deref(&self) -> &Self::Target {
+        &list!(self.list).nodes[self.view].value
+    }
 }
 
 impl<'t, T: 't,> AsRef<T> for View<'t, T,> {
     #[inline]
-    fn as_ref(&self) -> &T { &make_ref!(self.view).value }
+    fn as_ref(&self) -> &T { &list!(self.list).nodes[self.view].value }
 }
 
 impl<'t, T: 't,> Borrow<T> for View<'t, T,> {
     #[inline]
-    fn borrow(&self) -> &T { &make_ref!(self.view).value }
+    fn borrow(&self) -> &T { &list!(self.list).nodes[self.view].value }
 }
 
 impl<'t, T: 't + PartialEq,> PartialEq for View<'t, T,> {

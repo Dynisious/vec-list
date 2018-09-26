@@ -43,15 +43,18 @@ fn test_vec_list() {
         "`VecList::shink_to_fit` did not shink to minimum size",
     );
 
-    let mut list = VecList::<i32>::from_iter(0..=3);
+    let mut list2 = VecList::<i32>::from_iter(0..=3);
     
-    list.retain(|&i: &i32| i % 2 == 0);
-    assert_eq!(list.iter().collect::<Vec<_>>(), vec![&0, &2,],
+    list2.retain(|&i: &i32| i % 2 == 0);
+    assert_eq!(list2.iter().collect::<Vec<_>>(), vec![&0, &2,],
         "`VecList::retain` did not retain proper values"
     );
 
-    list.clear();
-    assert!(list.is_empty(), "`VecList::clear` did not clear all values");
+    list2.clear();
+    assert!(list2.is_empty(), "`VecList::clear` did not clear all values");
+    
+    ::std::mem::forget(list2);
+    ::std::mem::forget(list);
 }
 
 #[test]
@@ -141,12 +144,28 @@ fn test_view_mut() {
     assert_eq!(list.view_mut(10), &10, "`VecList::view` got wrong value 1",);
     assert_eq!(list.view_mut(0), &0, "`VecList::view` got wrong value 2",);
 
-    let view = list.view(3);
+    let mut view = list.view_mut(3);
     assert_eq!(view, &3, "`VecList::view` got wrong value 3",);
-    assert_eq!(view.next().expect("Failed to get next value"), &4,
+    assert_eq!(*view.next().expect("Failed to get next value"), &4,
         "`View::next` got wrong value",
     );
-    assert_eq!(view.prev().expect("Failed to get prev value"), &2,
+    assert_eq!(*view.prev().expect("Failed to get prev value"), &3,
         "`View::prev` got wrong value",
+    );
+    
+    let value = view.pop_before()
+        .expect("`VecList::pop_before` did not return a value");
+    assert_eq!(value, 2, "`VecList::pop_before` did not return the expected value",);
+    view.insert_before(value);
+    assert_eq!(*view.prev().expect("Failed to get prev value"), &2,
+        "`View::insert_before` inserted value wrong",
+    );
+    
+    let value = view.pop_after()
+        .expect("`VecList::pop_after` did not return a value");
+    assert_eq!(value, 3, "`VecList::pop_after` did not return the expected value",);
+    view.insert_after(value);
+    assert_eq!(*view.next().expect("Failed to get ext value"), &3,
+        "`View::insert_after` inserted value wrong",
     );
 }
