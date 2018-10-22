@@ -1,33 +1,64 @@
 
-pub use std::{
-    mem::ManuallyDrop,
-    marker::PhantomData,
-};
+use {VecList,};
+use std::mem::ManuallyDrop;
 
-/// A `Node` is a single `Node` in a doubly linked list.
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug,)]
-pub struct Node<'t, T: 't,> {
-    /// The value stored in this `Node`.
-    pub value: ManuallyDrop<T,>,
-    /// The pointer to the previous `Node`.
-    pub prev: Option<usize,>,
-    /// The pointer to the next `Node`.
-    pub next: Option<usize,>,
-    /// A marker to consume the lifetime parameter.
-    _marker: PhantomData<&'t ()>,
+/// A node in a double linked list.
+pub struct Node<T,> {
+  /// The value inside this [`Node`].
+  pub value: ManuallyDrop<T>,
+  /// The index of the next [`Node`].
+  pub prev: Option<usize>,
+  /// The index of the previous [`Node`].
+  pub next: Option<usize>,
 }
 
-impl<'t, T: 't,> Node<'t, T,> {
-    /// Create a new `Node` populated with the value.
-    #[inline]
-    pub fn new(value: T,) -> Self {
-        Self {
-            value: ManuallyDrop::new(value),
-            prev: None, next: None,
-            _marker: PhantomData::default(),
-        }
+impl<T,> Node<T,> {
+  /// Create a new, populated [`Node`].
+  /// 
+  /// # Params
+  /// 
+  /// value --- The value to populate the [`Node`] with.  
+  #[inline]
+  pub fn new(value: T,) -> Self {
+    Self { value: ManuallyDrop::new(value,), prev: None, next: None, }
+  }
+  /// Get the previous [`Node`].
+  /// 
+  /// # Panics
+  /// 
+  /// * If there is no previous [`Node`].
+  #[inline]
+  pub fn prev(&self,) -> usize {
+    self.prev.expect("`Node::prev` no previous `Node`")
+  }
+  /// Get the next [`Node`].
+  /// 
+  /// # Panics
+  /// 
+  /// * If there is no next [`Node`].
+  #[inline]
+  pub fn next(&self,) -> usize {
+    self.next.expect("`Node::next` no next `Node`")
+  }
+  /// Removes the [`Node`] from a doubley linked list.
+  /// 
+  /// # Params
+  /// 
+  /// list --- The [`VecList`] this [`Node`] is inside.
+  pub fn disconnect(&mut self, list: &mut VecList<T,>,) {
+    //Update the next pointer of the previous `Node`.
+    if let Some(prev) = self.prev {
+      unsafe { &mut *list.node_mut(prev) }.next = self.next;
     }
-    /// A way to unsafely move the value out of the `Node`.
-    #[inline]
-    pub unsafe fn move_value(&self,) -> T { (&*self.value as *const T).read() }
+    //Update the previous pointer of the next `Node` and clear the current `Node`.
+    if let Some(next) = self.next.take() {
+      unsafe { &mut *list.node_mut(next) }.prev = self.prev.take();
+    }
+  }
+  /// Pushes this [`Node`] into the head of a stack.
+  #[inline]
+  pub fn stack_push(&mut self, next: usize,) { self.next = Some(next) }
+  /// Pops this [`Node`] off the head of a stack.
+  #[inline]
+  pub fn stack_pop(&mut self,) -> Option<usize> { self.next.take() }
 }

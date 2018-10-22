@@ -1,161 +1,132 @@
 
-use ::*;
-use std::{
-    iter::*,
-    ops::{Drop, RangeBounds, Bound,},
-};
+use {VecList, NonZeroUsize,};
+use std::{iter::*, ops::Drop,};
 
-macro_rules! list {
-    ($ptr:expr) => (unsafe { &mut *$ptr });
-}
-
-/// Creates a new `Drain` iterator from parts.
+/// Creates a new [`Drain`] iterator.
 /// 
 /// # Params
 /// 
-/// list --- The `VecList` to iterator over.  
-/// range --- The range of indexes to iterate over.
-pub fn new_drain<'t, T: 't, R,>(list: &'t mut VecList<T,>, range: R,) -> Drain<'t, T,>
-    where R: RangeBounds<usize,> {
-    use imply_option::*;
-    
-    //Get the start bound.
-    let start = match range.start_bound() {
-        //If the bound is included, use it.
-        Bound::Included(&start) => start,
-        //If the bound is excluded, advance it.
-        Bound::Excluded(&start) => start + 1,
-        //If it is unbounded, start from the 0th index.
-        Bound::Unbounded => 0,
-    };
-    //Get the end bound.
-    let ends = match range.end_bound() {
-        //If the bound is included, use the bound.
-        Bound::Included(&end) => Some((start, end,)),
-        //If the bound is excluded, advance the bound.
-        Bound::Excluded(&end) => Some((start, end - 1,)),
-        //If it is unbounded, use the length.
-        //  If the list is empty, there are no ends and no values.
-        Bound::Unbounded => (list.len() > 0).then((start, list.len().saturating_sub(1),)),
-    };
-    //Validate the ends.
-    let ends = match ends {
-        None => None,
-        Some((start, end,)) => {
-            assert!(start <= end, "The range must be acending",);
-            assert!(end < list.len(), "The end of the range must be less than the length",);
-
-            eprintln!("{}, {}, {}", start, end, list.len(),);
-            //Convert the index bounds to their actual `Node` indexes.
-            Some((list.get_index(start,), list.get_index(end,),))
-        },
-    };
-    
-    Drain { list, ends, }
+/// list --- The [`VecList`] being iterated over.  
+/// ends --- The ends of the range being iterated over.  
+pub fn drain<'t, T: 't,>(list: &'t mut VecList<T,>, ends: Option<(usize, usize,)>,) -> Drain<'t, T,> {
+  Drain { list, ends, }
 }
 
-/// A `Drain` iterator which lazily removes all of the values in its range.
-#[derive(PartialEq, Eq, PartialOrd, Ord,)]
+/// An iterator which removes values from a range in a [`VecList`].
+/// 
+/// The values in the range will be removed even if they are not iterated over.
 pub struct Drain<'t, T: 't,> {
-    //The `VecList` to iterate over.
-    list: *mut VecList<'t, T,>,
-    //The ends to iterate over.
-    ends: Option<(usize, usize,)>,
-}
-
-impl<'t, T: 't,> Drop for Drain<'t, T,> {
-    //Drop all values in the range, even if the user does not iterate over them.
-    //Iterating them like this ensures that the values will be dropped.
-    #[inline]
-    fn drop(&mut self) { self.for_each(|_| ()) }
+  /// The [`VecList`] being drained.
+  list: &'t mut VecList<T,>,
+  /// The ends of the range being drained over.
+  ends: Option<(usize, usize,)>,
 }
 
 impl<'t, T: 't,> Iterator for Drain<'t, T,> {
-    type Item = T;
+  type Item = T;
 
-    fn next(&mut self) -> Option<Self::Item,> {
-        let list = list!(self.list);
+  #[inline]
+  fn next(&mut self,) -> Option<Self::Item> {
+    self.ends.map(|(front, back,)| { unsafe {
+      use imply_option::ImplyOption;
+      use std::hint;
 
-        self.ends.map(|(node, tail,)| {
-            //If the `Node` is an end pointer for the `VecList` the end pointer needs to be updated.
-            if let Some((l_head, l_tail,)) = list.ends {
-                //Check if the `Node` is an end pointer for the `VecList`.
-                match (node == l_head, node == l_tail,) {
-                    //If the `Node` is both pointers, there is only a single `Node` being removed.
-                    (true, true,) => list.ends = None,
-                    //If the `Node` is the head pointer, advance the head pointer.
-                    (true, false,) => list.ends = list.nodes[node].next.map(|next| (next, l_tail,)),
-                    //If the `Node` is the tail pointer, advance the tail pointer.
-                    (false, true,) => list.ends = list.nodes[node].prev.map(|prev| (l_head, prev,)),
-                    //If the `Node` is neither pointer, no change.
-                    _ => (),
-                }
-            }
+      //The `Node` of the `front` pointer.
+      let front_node = &*self.list.node(front,);
 
-            //If the `Node` is the tail pointer while advancing forward, this is the final value.
-            self.ends = if node == tail { None }
-                //Advance the head pointer.
-                else { list.nodes[node].next.map(|next| (next, tail,)) };
-            
-            //Remove the `Node`.
-            list.remove_node(node,)
-        })
-    }
-    fn size_hint(&self) -> (usize, Option<usize,>,) {
-        let len = match self.ends {
-            //If there are no end pointers, there are no values.
-            None => 0,
-            Some((mut node, tail,)) => {
-                let list = list!(self.list);
-                //If there are end pointers, there is at least 1 value to remove.
-                let mut count = 1;
+      //Update the ends of the range being iterated over.
+      self.ends = (front != back).then_do(|| (front_node.next(), back,),);
+      //Update the ends of the `VecList`.
+      match self.list.ends {
+        //Iteration would not be happening if the `VecList` was empty.
+        None => hint::unreachable_unchecked(),
+        //If there is only a single node, the `VecList` is now empty.
+        Some((len, head, tail,)) => {
+          let nlen = NonZeroUsize::new_unchecked(len.get() - 1,);
+          
+          if head == tail { self.list.ends = None }
+          //If the head has been drained, update the head pointer.
+          else if head == front { self.list.ends = Some((nlen, front_node.next(), tail,)) }
+          //If the tail has been drained, update the tail pointer.
+          else if tail == front { self.list.ends = Some((nlen, head, front_node.prev(),)) }
+        },
+      }
 
-                //Count the remaining `Node`s.
-                while node != tail {
-                    count += 1;
-                    node = list.nodes[node].next
-                        .expect(&node_err!());
-                }
-
-                count
-            },
-        };
-        
-        (len, Some(len),)
-    }
+      //Deallocate the `Node`.
+      self.list.dealloc_node(front,)
+    }})
+  }
+  fn size_hint(&self) -> (usize, Option<usize>,) {
+    //If there are ends there is at least one more value.
+    if self.ends.is_some() { (1, None,) }
+    //Else there are no values.
+    else { (0, Some(0),) }
+  }
 }
 
 impl<'t, T: 't,> DoubleEndedIterator for Drain<'t, T,> {
-    fn next_back(&mut self) -> Option<Self::Item,> {
-        let list = list!(self.list);
+  #[inline]
+  fn next_back(&mut self,) -> Option<Self::Item> {
+    self.ends.map(|(front, back,)| { unsafe {
+      use imply_option::ImplyOption;
+      use std::hint;
 
-        self.ends.map(|(head, node,)| {
-            //If the `Node` is an end pointer for the `VecList` the end pointer needs to be updated.
-            if let Some((l_head, l_tail,)) = list.ends {
-                match (node == l_head, node == l_tail,) {
-                    //If the `Node` is both end pointers, then the last value is being removed.
-                    (true, true,) => list.ends = None,
-                    //If the `Node` is the head pointer, advance the head pointer.
-                    (true, false,) => list.ends = list.nodes[node].next.map(|next| (next, l_tail,)),
-                    //If the `Node` is the tail pointer, advance the tail pointer.
-                    (false, true,) => list.ends = list.nodes[node].prev.map(|prev| (l_head, prev,)),
-                    //If the `Node` is neither end pointer, then no change needed.
-                    _ => (),
-                }
-            }
-            //If the `Node` is the head pointer while advancing backwards, this is the final value.
-            self.ends = if node == head { None }
-                //Else advance the tail pointer.
-                else { list.nodes[node].prev.map(|prev| (head, prev,)) };
-            
-            //Remove the `Node`.
-            list.remove_node(node,)
-        })
-    }
+      //The `Node` of the `back` pointer.
+      let back_node = &*self.list.node(back,);
+
+      //Update the ends of the range being iterated over.
+      self.ends = (front != back).then_do(|| (front, back_node.prev(),),);
+      //Update the ends of the `VecList`.
+      match self.list.ends {
+        //Iteration would not be happening if the `VecList` was empty.
+        None => hint::unreachable_unchecked(),
+        //If there is only a single node, the `VecList` is now empty.
+        Some((len, head, tail,)) => {
+          let nlen = NonZeroUsize::new_unchecked(len.get() - 1,);
+          
+          if head == tail { self.list.ends = None }
+          //If the head has been drained, update the head pointer.
+          else if head == back { self.list.ends = Some((nlen, back_node.next(), tail,)) }
+          //If the tail has been drained, update the tail pointer.
+          else if tail == back { self.list.ends = Some((nlen, head, back_node.prev(),)) }
+        },
+      }
+
+      //Deallocate the `Node`.
+      self.list.dealloc_node(back,)
+    }})
+  }
 }
 
-unsafe impl<'t, T: 't,> TrustedLen for Drain<'t, T,> {}
+impl<'t, T: 't,> Drop for Drain<'t, T,> {
+  #[inline]
+  fn drop(&mut self,) { self.for_each(|_| ()) }
+}
 
-impl<'t, T: 't,> ExactSizeIterator for Drain<'t, T,> {}
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use testdrop::*;  
 
-impl<'t, T: 't,> FusedIterator for Drain<'t, T,> {}
+  #[test]
+  fn test_drain() {
+    let test_drop = TestDrop::new();
+    let mut list = VecList::<Item>::with_capacity(3,);
+    let mut ids = Vec::with_capacity(3,);
+
+    for _ in 0..5 {
+      let (id, item,) = test_drop.new_item();
+
+      list.push_back(item,);
+      ids.push(id,);
+    }
+    
+    list.drain(1..4);
+    
+    test_drop.assert_no_drop(ids[0]);
+    test_drop.assert_drop(ids[1]);
+    test_drop.assert_drop(ids[2]);
+    test_drop.assert_drop(ids[3]);
+    test_drop.assert_no_drop(ids[4]);
+  }
+}

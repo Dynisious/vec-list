@@ -4,661 +4,412 @@
 //! Author --- daniel.bechaz@gmail.com  
 //! Last Moddified --- 2018-09-24
 
-#![feature(exact_size_is_empty)]
-#![feature(min_const_fn)]
-#![feature(const_vec_new)]
-#![feature(const_manually_drop_new)]
-#![feature(trusted_len)]
-#![feature(nll)]
+#![deny(missing_docs,)]
+#![feature(const_fn, const_vec_new, nll, allocator_api, specialization, trusted_len, ptr_offset_from,)]
 
 extern crate imply_option;
+extern crate testdrop;
 
 use std::{
-    cmp::{PartialEq, PartialOrd, Ord, Ordering,},
-    iter::{FromIterator, Extend,},
-    ops::{Index, IndexMut, RangeBounds,},
-    fmt::{self, Debug,},
+  ops::{RangeBounds, Bound, Drop,},
+  iter::{FromIterator, Extend, TrustedLen,},
+  num::NonZeroUsize,
 };
 
+mod raw_vec;
 mod nodes;
 mod iters;
-mod views;
-mod tests;
 
-use self::nodes::*;
-use self::iters::{Iter, IterMut, Drain, DrainFilter,};
-pub use self::views::{View, ViewMut,};
+use self::{nodes::*, raw_vec::*,};
+pub use self::iters::Drain;
 
-/// An implementation of a doubly-linked-list backed by a `Vec` so that it will avoid
-/// cache misses during access.
-#[derive(Eq, Clone,)]
-pub struct VecList<'t, T: 't,> {
-    /// The [`Node`](struct.Node.html)s of the [`VecList`].
-    nodes: Vec<Node<'t, T,>,>,
-    /// The number of [`Node`](struct.Node.html)s in the [`VecList`].
-    len: usize,
-    /// The starting and ending indexes of the linked list in [`nodes`]
-    ends: Option<(usize, usize,)>,
-    /// A stack of allocated [`Node`](struct.Node.html)s not used in the linked list.
-    empty: Option<usize,>,
+/// A [`VecList`] is an implementation of a Double Linked List.
+/// 
+/// A [`VecList`] stores its nodes in an underlying buffer so as to minimise cache
+/// misses during access.
+/// 
+/// The rational behind this is that in most cases ~O(1) appends are good enough when
+/// using a [`Vec`] as a list but in the cases where inserts and removes are in the
+/// middle of a list a linked list has the advantage; hence backing a linked list with a
+/// buffer gives us the best of both worlds when making modifications in the middle of
+/// the list.
+pub struct VecList<T,> {
+  /// The underlying [`RawVec`] of [`Node`]s.
+  buf: RawVec<Node<T,>,>,
+  /// The number of [`Node`]s in the [`VecList`]s buf.
+  node_count: usize,
+  /// The indexes to the ends of the linked list and the length of the linked list.
+  ends: Option<(NonZeroUsize, usize, usize,)>,
+  /// The index to the head of the stack of empty [`Node`]s and the size of the stack.
+  empty: Option<(NonZeroUsize, usize,)>,
 }
 
-impl<'t, T: 't,> VecList<'t, T,> {
-    /// Append the `to` to `from`.
-    /// 
-    /// # Params
-    /// 
-    /// from --- The index of the [`Node`](struct.Node.html) to append to.  
-    /// to --- The index of the [`Node`](struct.Node.html) to append.
-    /// 
-    /// # Panics
-    /// 
-    /// * If `from` has a `next` pointer.  
-    /// * If `to` has a `prev` pointer.
-    fn append(&mut self, from: usize, to: usize,) {
-        debug_assert!(self.nodes[from].next.is_none(), format!("`from` has `next`: {:?}", from,),);
-        debug_assert!(self.nodes[to].prev.is_none(), format!("`to` has `prev`: {:?}", to,),);
+impl<T,> VecList<T,> {
+  /// Gets a reference to the [`Node`] at `ptr` in the [`VecList`]s buffer.
+  #[inline]
+  unsafe fn node(&self, ptr: usize,) -> *const Node<T,> {
+    self.buf.ptr().add(ptr,)
+  }
+  /// Gets a mutable reference to the [`Node`] at `ptr` in the [`VecList`]s buffer.
+  #[inline]
+  unsafe fn node_mut(&mut self, ptr: usize,) -> *mut Node<T,> {
+    self.buf.ptr().add(ptr,)
+  }
+  /// Appends and links the two [`Node`]s.
+  /// 
+  /// # Params
+  /// 
+  /// node --- The pointer to the [`Node`] to be first in the pair.  
+  /// next --- The pointer to the [`Node`] to be second in the pair.
+  #[inline]
+  unsafe fn node_append(&mut self, node: usize, next: usize,) {
+    (*self.node_mut(node,)).next = Some(next);
+    (*self.node_mut(next,)).prev = Some(node);
+  }
+}
 
-        //Append the Nodes.
-        self.nodes[from].next = Some(to);
-        self.nodes[to].prev = Some(from);
-    }
-    /// Disconnect the passed [`Node`](struct.Node.html).
+impl<T,> VecList<T,> {
+  /// Get the index to the [`Node`] at `index` in the [`VecList`].
+  /// 
+  /// # Panics
+  /// 
+  /// * If `index >= self.len()`
+  fn ptr(&self, index: usize,) -> usize {
+    /// Get the pointer to the [`Node`] `steps` steps backwards from `link`.
     /// 
     /// # Params
     /// 
-    /// node --- The index of the [`Node`](struct.Node.html) to disconnect.
-    fn disconnect(&mut self, node: usize,) {
-        //Disconnect `node`.
-        let next = self.nodes[node].next.take();
-        let prev = self.nodes[node].prev.take();
+    /// list --- The [`VecList`] to get [`Node`]s from.  
+    /// link --- The [`Node`] to step from.  
+    /// steps --- The number of steps backwards to take from `link`.  
+    #[inline]
+    fn backwards<T,>(list: &VecList<T,>, link: usize, steps: usize,) -> usize {
+      if steps == 0 { link }
+      else { backwards(list, unsafe { (*list.buf.ptr().add(link)).prev() }, steps - 1,) }
+    }
+    /// Get the pointer to the [`Node`] `steps` steps frowards from `link`.
+    /// 
+    /// # Params
+    /// 
+    /// list --- The [`VecList`] to get [`Node`]s from.  
+    /// link --- The [`Node`] to step from.  
+    /// steps --- The number of steps frowards to take from `link`.  
+    #[inline]
+    fn forwards<T,>(list: &VecList<T,>, link: usize, steps: usize,) -> usize {
+      if steps == 0 { link }
+      else { forwards(list, unsafe { (*list.buf.ptr().add(link)).next() }, steps - 1,) }
+    }
+
+    //Validate index.
+    assert!(index < self.len(), "`VecList::ptr` index out of range",);
+
+    //Calculate how many steps need to be taken from the end.
+    let back_index = self.len() - index - 1;
+
+    //Take the shortest number of steps.
+    match self.ends.expect("`VecList::ptr` called on an empty `VecList`",) {
+      //Go from the back.
+      (_, _, end,) if back_index < index => backwards(self, end, back_index,),
+      //Go from the front.
+      (_, start, _,) => forwards(self, start, index,),
+    }
+  }
+  /// Allocate a new [`Node`] populated with `value`.
+  fn alloc_node(&mut self, value: T,) -> usize {
+    match self.empty {
+      //Allocate a new [`Node`] in the buffer.
+      None => {
+        let node = self.node_count;
+
+        self.node_count += 1;
+        self.reserve(1,);
+        unsafe { *self.node_mut(node,) = Node::new(value,); }
+
+        node
+      },
+      //Allocate a [`Node`] from the empty stack.
+      Some((len, empty,)) => { unsafe {
+        self.empty = (*self.node_mut(empty,)).stack_pop()
+          .map(|empty| (NonZeroUsize::new_unchecked(len.get() - 1,), empty,));
         
-        //Relink `node`s neighbours.
-        if let Some(next) = next { self.nodes[next].prev = prev }
-        if let Some(prev) = prev { self.nodes[prev].next = next }
+        *self.node_mut(empty,) = Node::new(value,);
+
+        empty
+      } }
     }
-    /// Creates a new [`Node`](struct.Node.html) and returns its index.
-    /// 
-    /// # Params
-    /// 
-    /// value --- The value to populate the [`Node`](struct.Node.html) with.
-    fn new_node(&mut self, value: T,) -> usize {
-        //Increase the length.
-        self.len += 1;
+  }
+  /// Deallocate the [`Node`] at `ptr` in the buffer.
+  /// 
+  /// # Params
+  /// 
+  /// ptr --- The index of the [`Node`] in `buf`.
+  fn dealloc_node(&mut self, ptr: usize,) -> T {
+    let node = unsafe { &mut *self.buf.ptr().add(ptr) };
 
-        match self.empty {
-            //There is a preallocated empty `Node`.
-            Some(new) => {
-                //Pop the empty `Node`.
-                self.empty = self.nodes[new].next;
-                //Disconnect the popped `Node`.
-                self.disconnect(new);
-                //Populate the `Node`.
-                self.nodes[new].value = ManuallyDrop::new(value);
-
-                new
-            },
-            //There is no preallocated empty `Node`.
-            None => {
-                //Get the index of the new `Node`.
-                let new = self.nodes.len();
-
-                //Push the new `Node`.
-                self.nodes.push(Node::new(value));
-
-                new
-            },
-        }
-    }
-    /// Empty the passed [`Node`](struct.Node.html).
-    /// 
-    /// The [`Node`](struct.Node.html) will be placed on the `empty` stack.  
-    /// The value in the [`Node`](struct.Node.html) is returned.
-    /// 
-    /// # Params
-    /// 
-    /// node --- The [`Node`](struct.Node.html) to remove.
-    fn remove_node(&mut self, node: usize,) -> T {
-        //Decrement the `Node` count.
-        self.len -= 1;
+    node.disconnect(self,);
+    self.empty = match self.empty {
+      None => Some((unsafe { NonZeroUsize::new_unchecked(1,) }, ptr,)),
+      Some((len, empty,)) => {
+        node.stack_push(empty,);
         
-        //Disconnect the `Node`.
-        self.disconnect(node,);
-        //Link the `Node` to the empty stack.
-        if let Some(empty) = self.empty { self.append(node, empty) }
-        //Push the `Node` onto the empty stack.
-        self.empty = Some(node);
-        //Return the value.
-        unsafe { self.nodes[node].move_value() }
-    }
-    /// Returns the index of the [`Node`](struct.Node.html) representing `index` in the
-    /// linked list.
-    /// 
-    /// # Params
-    /// 
-    /// index --- The `index` in the linked-list to find.
-    /// 
-    /// # Panics
-    /// 
-    /// * If `index` is out of bounds.
-    fn get_index(&self, index: usize,) -> usize {
-        assert!(index <= self.len, "`index` is out of bounds",);
+        Some((unsafe { NonZeroUsize::new_unchecked(len.get() + 1,) }, ptr,))
+      },
+    };
 
-        //Calculate the nunber of steps backwards to take.
-        let back_step = self.len - 1 - index;
-
-        //Take the smallest number of steps to the `Node`.
-        if index <= back_step { self.index_forward(index) }
-        else { self.index_backward(back_step) }
-    }
-    /// Returns the index of the [`Node`](struct.Node.html) some steps forward in the
-    /// linked list.
-    /// 
-    /// # Params
-    /// 
-    /// steps --- The number of steps to take forward in the linked list.
-    /// 
-    /// # Panics
-    /// 
-    /// * If `steps` is out of bounds.
-    fn index_forward(&self, steps: usize,) -> usize {
-        /// Step to the specified index.
-        /// 
-        /// # Params
-        /// 
-        /// list --- The [`VecList`] to index in.  
-        /// steps --- The number of steps to take.  
-        /// at --- The current position.
-        fn index<T>(list: &VecList<T,>, steps: usize, at: usize,) -> usize {
-            //Check if there are more steps to do.
-            if steps == 0 { return at }
-
-            //Take the next step.
-            index(list, steps - 1, list.nodes[at].next.expect("index_forward: 2"))
-        }
-        
-        eprintln!("temp: {}, {}, {:?}", self.len(), steps, self.ends,);
-        //Step forward.
-        index(self, steps, self.ends.expect("index_forward: 1").0)
-    }
-    /// Returns the index of the [`Node`](struct.Node.html) some steps backwards in the
-    /// linked list.
-    /// 
-    /// # Params
-    /// 
-    /// steps --- The number of steps to take backward in the linked list.
-    /// 
-    /// # Panics
-    /// 
-    /// * If `steps` is out of bounds.
-    fn index_backward(&self, steps: usize,) -> usize {
-        /// Step to the specified index.
-        /// 
-        /// # Params
-        /// 
-        /// list --- The [`VecList`] to index in.  
-        /// steps --- The number of steps to take.  
-        /// at --- The current position.
-        fn index<T>(list: &VecList<T,>, steps: usize, at: usize,) -> usize {
-            //Check if there are more steps to do.
-            if steps == 0 { return at }
-
-            //Take the next step.
-            index(list, steps - 1, list.nodes[at].prev.expect("index_backward: 2"))
-        }
-        
-        //Step backward.
-        index(self, steps, self.ends.expect("index_backward: 1").1)
-    }
+    unsafe { (&*node.value as *const T).read() }
+  }
 }
 
-impl<'t, T: 't,> VecList<'t, T,> {
-    /// Returns a new empty [`VecList`].
-    #[inline]
-    pub const fn new() -> Self {
-        Self { nodes: Vec::new(), len: 0, ends: None, empty: None, }
+impl<T,> VecList<T,> {
+  /// Forwards the call to `VecList::with_capacity(0)`.
+  #[inline]
+  pub fn new() -> Self { Self::with_capacity(0,) }
+  /// Constructs a new empty [`VecList`] with space for `capacity` nodes in the
+  /// underlying buffer.
+  #[inline]
+  pub fn with_capacity(capacity: usize,) -> Self {
+    Self { buf: RawVec::with_capacity(capacity), node_count: 0, ends: None, empty: None, }
+  }
+  /// Returns the capacity of the underlying buffer.
+  #[inline]
+  pub fn capacity(&self,) -> usize { self.buf.cap() }
+  /// Reserves enough capacity for exactly `additional` more elements to be inserted into
+  /// the [`VecList`].
+  /// 
+  /// # Panics
+  /// 
+  /// * If the new capacity overflows usize.  
+  #[inline]
+  pub fn reserve_exact(&mut self, mut additional: usize,) {
+    //Remove the empty `Node`s count from additional.
+    if let Some((empty, _,)) = self.empty {
+      additional = additional.saturating_sub(empty.get(),)
     }
-    /// Returns a new empty [`VecList`] with room for `capacity` [`Node`](struct.Node.html)s.
-    /// 
-    /// # Params
-    /// 
-    /// capacity --- The number of spaces to allocate.
-    #[inline]
-    pub fn with_capacity(capacity: usize,) -> Self {
-        Self { nodes: Vec::with_capacity(capacity), len: 0, ends: None, empty: None, }
-    }
-    /// Reserves space for at least `additional` number of [`Node`](struct.Node.html)s.
-    /// 
-    /// # Params
-    /// 
-    /// additional --- The number of additional spaces to allocate for.
-    pub fn reserve(&mut self, mut additional: usize,) {
-        //The stack of empty `Node`s.
-        let mut empty = self.empty;
 
-        loop {
-            match empty {
-                //No more empty `Node`s.
-                None => break,
-                //Remove the empty `Node` from the `additional` count.
-                Some(node,) => {
-                    //If this is the last additional space, no additional spaces are needed.
-                    if additional == 1 { return }
-                    additional -= 1;
-                    empty = self.nodes[node].next;
-                },
-            }
-        }
+    self.buf.reserve_exact(self.node_count, additional,)
+  }
+  /// Reserves enough capacity for at least `additional` more elements to be inserted
+  /// into the [`VecList`].
+  #[inline]
+  pub fn reserve(&mut self, mut additional: usize,) {
+    //Remove the empty `Node`s count from additional.
+    if let Some((empty, _,)) = self.empty {
+      additional = additional.saturating_sub(empty.get(),)
+    }
 
-        //Reserve the necessary nodes.
-        self.nodes.reserve(additional,)
-    }
-    /// Reserves space for exactly `additional` number of [`Node`](struct.Node.html)s.
-    /// 
-    /// # Params
-    /// 
-    /// additional --- The number of additional spaces to allocate.
-    pub fn reserve_exact(&mut self, mut additional: usize,) {
-        //The stack of empty `Node`s.
-        let mut empty = self.empty;
-
-        loop {
-            match empty {
-                //No more empty `Node`s.
-                None => break,
-                //Remove the empty `Node` from the `additional` count.
-                Some(node,) => {
-                    //If this is the last additional space, no additional spaces are needed.
-                    if additional == 1 { return }
-                    additional -= 1;
-                    empty = self.nodes[node].next;
-                },
-            }
-        }
-
-        //Reserve the necessary nodes.
-        self.nodes.reserve_exact(additional,)
-    }
-    /// Shrinks the [`VecList`] to only store the existing values.
-    #[inline]
-    pub fn shrink_to_fit(&mut self,) {
-        /// Forgets empty `Nodes` until a node which will be retained is found.
-        /// 
-        /// # Params
-        /// 
-        /// list --- The [`VecList`] to clean.
-        #[inline]
-        fn clean_empty<'t, T: 't,>(list: &mut VecList<'t, T,>) {
-            //Get the head of the empty stack.
-            if let Some(empty) = list.empty {
-                //If this node is going to be retained, stop.
-                if empty >= list.len() {
-                    //Pop the head of the empty `Node`.
-                    list.empty = list.nodes[empty].next;
-                    //Keep cleaning.
-                    clean_empty(list);
-                }
-            }
-        }
-        
-        //Get the ends of the [`VecList`].
-        if let Some((mut head, tail,)) = self.ends {
-            //Check if the head needs to be cleaned.
-            if head >= self.len() {
-                //Get the next empty `Node`.
-                clean_empty(self);
-                
-                //Specify the new `head` `Node`.
-                let new_head = self.empty.expect("shrink_to_fit: 1");
-
-                //Pop the `Node` of the empty stack.
-                self.empty = self.nodes[new_head].next;
-                //Populate the new `head` `Node` to be the previous `head` `Node`.
-                self.nodes[new_head] = unsafe { (&mut self.nodes[head] as *mut Node<T,>).read() };
-                //Update the `prev` pointer for the next `Node` to point at the new `head` `Node`.
-                self.nodes[new_head].next.map(
-                    |next| self.nodes[next].prev = Some(new_head)
-                );
-
-                //Update the `head` pointer.
-                head = new_head;
-                //If there is only a single `Node`, update the tail pointer and return.
-                if tail == head {
-                    return self.ends = Some((new_head, new_head,));
-                //Else update the head pointer and keep cleaning.
-                } else {
-                    self.ends = Some((new_head, tail,));
-                }
-            }
-
-            let mut cur_node = head;
-            //Loop while the empty stack contains `Node`s to populate.
-            loop {
-                //Get the next empty `Node`.
-                clean_empty(self);
-                //Check if there is an empty `Node` to populate.
-                match self.empty {
-                    None => break,
-                    //There is an empty `Node` to populate.
-                    Some(new_node) => {
-                        //Get an invalid `Node`.
-                        while cur_node < self.len() {
-                            cur_node = self.nodes[cur_node].next.expect("shrink_to_fit: 2");
-                        }
-
-                        //Populate the new `Node` to be the same as the old `Node`.
-                        self.nodes[new_node] = unsafe { (&mut self.nodes[cur_node] as *mut Node<T,>).read() };
-                        //---Update the new `Node`s neighbours.---
-                        self.nodes[new_node].next.map(
-                            |next| self.nodes[next].prev = Some(new_node)
-                        );
-                        self.nodes[new_node].prev.map(
-                            |prev| self.nodes[prev].next = Some(new_node)
-                        );
-                    },
-                }
-            }
-        }
-
-        //Remove all empty `Node`s.
-        self.nodes.truncate(self.len);
-        //Deallocate all unneeded space.
-        self.nodes.shrink_to_fit()
-    }
-    /// Clear the [`VecList`].
-    #[inline]
-    pub fn clear(&mut self) { self.drain(..); }
-    /// Returns the number of values in this [`VecList`].
-    #[inline]
-    pub const fn len(&self) -> usize { self.len }
-    /// `true` if this [`VecList`] is empty.
-    #[inline]
-    pub const fn is_empty(&self) -> bool { self.len() == 0 }
-    /// Returns the number of spaces in this [`VecList`].
-    #[inline]
-    pub fn capacity(&self) -> usize { self.nodes.capacity() }
-    /// Returns the first value.
-    #[inline]
-    pub fn front(&self) -> Option<&T,> {
-        self.ends.map(|(head, _,)| &*self.nodes[head].value)
-    }
-    /// Returns the first value.
-    #[inline]
-    pub fn front_mut(&mut self) -> Option<&mut T,> {
-        self.ends.map(move |(head, _,)| &mut *self.nodes[head].value)
-    }
-    /// Returns the last value.
-    #[inline]
-    pub fn back(&self) -> Option<&T,> {
-        self.ends.map(|(_, tail,)| &*self.nodes[tail].value)
-    }
-    /// Returns the last value.
-    #[inline]
-    pub fn back_mut(&mut self) -> Option<&mut T,> {
-        self.ends.map(move |(_, tail,)| &mut *self.nodes[tail].value)
-    }
-    /// Pushes a value onto the front of the [`VecList`].
-    /// 
-    /// # Params
-    /// 
-    /// The value to push on.
-    pub fn push_front(&mut self, value: T,) {
-        let new = self.new_node(value,);
-
-        self.ends = match self.ends {
-            None => Some((new, new,)),
-            Some((head, tail,)) => {
-                self.append(new, head,);
-                
-                Some((new, tail,))
-            }
-        };
-    }
-    /// Pops the first value off the front of the [`VecList`].
-    pub fn pop_front(&mut self,) -> Option<T,> {
-        match self.ends {
-            None => None,
-            Some((head, tail,)) => {
-                self.ends = self.nodes[head].next
-                    .map(|next| (next, tail,));
-                self.remove_node(head,);
-
-                Some(unsafe { self.nodes[head].move_value() },)
-            }
-        }
-    }
-    /// Pushes a value onto the back of the [`VecList`].
-    /// 
-    /// # Params
-    /// 
-    /// The value to push on.
-    pub fn push_back(&mut self, value: T,) {
-        let new = self.new_node(value,);
-
-        self.ends = match self.ends {
-            None => Some((new, new,)),
-            Some((head, tail,)) => {
-                self.append(tail, new,);
-                
-                Some((head, new,))
-            }
-        };
-    }
-    /// Pops the first value off the front of the [`VecList`].
-    pub fn pop_back(&mut self,) -> Option<T,> {
-        match self.ends {
-            None => None,
-            Some((head, tail,)) => {
-                self.ends = self.nodes[head].prev
-                    .map(|prev| (head, prev,));
-                self.remove_node(tail,);
-
-                Some(unsafe { self.nodes[tail].move_value() },)
-            }
-        }
-    }
-    /// Removes all values that don't pass the `pred` filter.
-    /// 
-    /// # Params
-    /// 
-    /// pred --- The filter function values need to pass to be retained.
-    pub fn retain(&mut self, mut pred: impl FnMut(&T) -> bool,) {
-        use imply_option::*;
-
-        if let Some((mut index, _,)) = self.ends {
-            loop {
-                let next = self.nodes[index].next;
-                
-                if !pred(&self.nodes[index].value) {
-                    self.ends = self.ends.and_then(
-                        |(head, tail,)| (head != index).then(head).or(next)
-                            .and_then(|head| (tail != index).then((head, tail,))
-                                .or(self.nodes[index].prev.map(|tail| (head, tail,)))
-                            )
-                    );
-                    
-                    self.remove_node(index);
-                }
-
-                match next {
-                    Some(next) => index = next,
-                    None => break,
-                }
-            }
-        }
-    }
-    /// Splits the [`VecList`] into two lists at the passed index.
-    /// 
-    /// # Params
-    /// 
-    /// at --- The index to split the [`VecList`] at.
-    /// 
-    /// # Panics
-    /// 
-    /// * If `at` is greater than the length of the [`VecList`].
-    pub fn split_at(&mut self, at: usize,) -> VecList<T,> {
-        assert!(at <= self.len(), "`at` was greater than the length of the `VecList`",);
-
-        //The list to return.
-        let mut list = VecList::with_capacity(self.len - 1 - at);
-        
-        //Push all the end values onto the new [`VecList`].
-        list.extend(self.drain(at..));
-
-        list
-    }
-    /// Returns an iterator over all values in the [`VecList`].
-    #[inline]
-    pub fn iter(&self) -> Iter<T> {
-        iters::new_iter(self, self.ends)
-    }
-    /// Returns a mutable iterator over all values in the [`VecList`].
-    #[inline]
-    pub fn iter_mut(&mut self) -> IterMut<T> {
-        iters::new_iter_mut(self, self.ends)
-    }
-    /// Returns a view into the [`VecList`] at the passed index.
-    /// 
-    /// # Params
-    /// 
-    /// index --- The index to start the [`View`](struct.View.html) at.
-    /// 
-    /// # Panics
-    /// 
-    /// * If `index` is greater than or equal to the length of the [`VecList`].
-    #[inline]
-    pub fn view(&self, index: usize) -> View<T> {
-        views::new_view(self, self.get_index(index),)
-    }
-    /// Returns a mutable view into the [`VecList`] at the passed index.
-    /// 
-    /// # Params
-    /// 
-    /// index --- The index to start the [`ViewMut`](struct.ViewMut.html) at.
-    /// 
-    /// # Panics
-    /// 
-    /// * If `index` is greater than or equal to the length of the [`VecList`].
-    #[inline]
-    pub fn view_mut(&mut self, index: usize) -> ViewMut<T> {
-        views::new_view_mut(self, self.get_index(index),)
-    }
-    /// Removes the values of `range` from the [`VecList`] and yields them as an iterator.
-    /// 
-    /// NOTE!!! Even if the iterator is not used, all values contained in the range will be removed.
-    /// 
-    /// # Params
-    /// 
-    /// range --- The range of values to remove.
-    /// 
-    /// # Panics
-    /// 
-    /// * If `range` uses fixed bounds which are not contained inside the [`VecList`].
-    #[inline]
-    pub fn drain<R>(&mut self, range: R,) -> Drain<T,>
-        where R: RangeBounds<usize,> {
-        iters::new_drain(self, range,)
-    }
-    /// Applies `filter` to each value in [`VecList`] and yields the values which return
-    /// `false`.
-    /// 
-    /// NOTE!!! The filter is given mutable access to all values, including the ones not returned.
-    /// 
-    /// # Params
-    /// 
-    /// filter --- The filter to apply to each value.
-    #[inline]
-    pub fn drain_filter<F>(&mut self, filter: F,) -> DrainFilter<T, F,>
-        where F: FnMut(&mut T,) -> bool, {
-        iters::new_drain_filter(self, filter)
-    }
+    self.buf.reserve(self.node_count, additional,)
+  }
+  /// Returns the number of elements in this [`VecList`].
+  #[inline]
+  pub fn len(&self,) -> usize {
+    self.ends.map_or(0, |(len, _, _,)| len.get(),)
+  }
+  /// Clears all values from this [`VecList`].
+  #[inline]
+  pub fn clear(&mut self,) { self.drain(..); }
 }
 
-impl<'t, T: 't + PartialEq,> VecList<'t, T,> {
-    /// Returns `true` if the `x` is found in the [`VecList`].
-    /// 
-    /// # Params
-    /// 
-    /// x --- The value to search for.
-    pub fn contains(&mut self, x: &T,) -> bool {
-        self.iter().find(|&y| x == y).is_some()
-    }
+impl<T,> VecList<T,> {
+  /// Pushes `value` onto the front of this [`VecList`].
+  pub fn push_front(&mut self, value: T,) {
+    let node = self.alloc_node(value,);
+
+    self.ends = unsafe { match self.ends {
+      None => Some((NonZeroUsize::new_unchecked(1,), node, node,)),
+      Some((len, head, tail,)) => {
+        self.node_append(node, head,);
+
+        Some((NonZeroUsize::new_unchecked(len.get() + 1,), node, tail,))
+      },
+    } };
+  }
+  /// Pops a value off the front of this [`VecList`].
+  #[inline]
+  pub fn pop_front(&mut self,) -> Option<T> {
+    self.ends.take().map(|(len, head, tail,)| {
+      let head_node = unsafe { &mut *self.node_mut(head,) };
+
+      self.ends = if head == tail { None }
+        else { Some((unsafe { NonZeroUsize::new_unchecked(len.get() - 1,) }, head_node.next(), tail,)) };
+      head_node.disconnect(self,);
+
+      self.dealloc_node(head,)
+    })
+  }
+  /// Pushes `value` onto the back of this [`VecList`].
+  pub fn push_back(&mut self, value: T,) {
+    let node = self.alloc_node(value,);
+
+    self.ends = unsafe { match self.ends {
+      None => Some((NonZeroUsize::new_unchecked(1,), node, node,)),
+      Some((len, head, tail,)) => {
+        self.node_append(tail, node,);
+
+        Some((NonZeroUsize::new_unchecked(len.get() + 1,), head, node,))
+      },
+    } };
+  }
+  /// Pops a value off the back of this [`VecList`].
+  #[inline]
+  pub fn pop_back(&mut self,) -> Option<T> {
+    self.ends.take().map(|(len, head, tail,)| {
+      let tail_node = unsafe { &mut *self.node_mut(tail,) };
+
+      self.ends = if head == tail { None }
+        else { Some((unsafe { NonZeroUsize::new_unchecked(len.get() - 1,) }, head, tail_node.prev(),)) };
+      tail_node.disconnect(self,);
+
+      self.dealloc_node(tail,)
+    })
+  }
 }
 
-impl<'t, T: 't,> Index<usize,> for VecList<'t, T,> {
-    type Output = T;
+impl<'t, T: 't,> VecList<T,> {
+  /// Removes the elements in `range` from the [`VecList`] and returns them as an
+  /// iterator.
+  /// 
+  /// # Params
+  /// 
+  /// range --- The range of indexes to remove.
+  /// 
+  /// # Panics
+  /// 
+  /// * If `range.end >= self.len()`.
+  pub fn drain<R,>(&'t mut self, range: R,) -> Drain<'t, T,>
+    where R: RangeBounds<usize>, {
+    use imply_option::ImplyOption;
 
-    #[inline]
-    fn index(&self, index: usize,) -> &Self::Output {
-        &self.nodes[self.get_index(index)].value
-    }
+    //Get the starting index.
+    let start = match range.start_bound() {
+      Bound::Excluded(&start,) => start + 1,
+      Bound::Included(&start,) => start,
+      Bound::Unbounded => 0,
+    };
+    //Get the ending index.
+    let end = match range.end_bound() {
+      Bound::Excluded(&end,) => Some(end.saturating_sub(1)),
+      Bound::Included(&end,) => Some(end),
+      Bound::Unbounded => self.len().checked_sub(1),
+    };
+    //Validate the ends.
+    let ends = match end {
+      Some(end) => if end < self.len() { (start <= end).then_do(|| (self.ptr(start), self.ptr(end),)) }
+        else { panic!("The end of the range must be less than the length of the `VecList`") },
+      None => None,
+    };
+
+    iters::drain(self, ends,)
+  }
 }
 
-impl<'t, T: 't,> IndexMut<usize,> for VecList<'t, T,> {
-    #[inline]
-    fn index_mut(&mut self, index: usize,) -> &mut Self::Output {
-        let index = self.get_index(index);
+impl<T,> FromIterator<T> for VecList<T,> {
+  #[inline]
+  fn from_iter<I,>(iter: I,) -> Self
+    where I: IntoIterator<Item = T>, {
+    let mut list = VecList::new();
 
-        &mut self.nodes[index].value
-    }
+    list.extend(iter,); list
+  }
 }
 
-impl<'t, T: 't, A: Into<T,>,> Extend<A,> for VecList<'t, T,> {
-    fn extend<I,>(&mut self, iter: I)
-        where I: IntoIterator<Item = A>, {
-        iter.into_iter().for_each(|item| self.push_back(item.into()))
-    }
+impl<T,> Extend<T> for VecList<T,> {
+  #[inline]
+  fn extend<I,>(&mut self, iter: I,)
+    where I: IntoIterator<Item = T>, {
+    self.spec_extend(iter.into_iter(),)
+  }
 }
 
-impl<'t, T: 't, A: Into<T>,> FromIterator<A,> for VecList<'t, T,> {
-    fn from_iter<I,>(iter: I) -> Self
-        where I: IntoIterator<Item = A>, {
-        let mut list = VecList::new();
+impl<'t, T: 't + Clone,> FromIterator<&'t T> for VecList<T,> {
+  #[inline]
+  fn from_iter<I,>(iter: I,) -> Self
+    where I: IntoIterator<Item = &'t T>, {
+    let mut list = VecList::new();
 
-        list.extend(iter); list
-    }
+    list.extend(iter,); list
+  }
 }
 
-impl<'t, T: 't + PartialEq,> PartialEq for VecList<'t, T,> {
-    fn eq(&self, rhs: &Self) -> bool {
-        self.iter().zip(rhs.iter())
-        .all(|(lhs, rhs,)| lhs == rhs)
-    }
+impl<'t, T: 't + Clone,> Extend<&'t T> for VecList<T,> {
+  #[inline]
+  fn extend<I,>(&mut self, iter: I,)
+    where I: IntoIterator<Item = &'t T>, {
+    self.spec_extend(iter.into_iter().cloned(),)
+  }
 }
 
-impl<'t, T: 't + PartialOrd,> PartialOrd for VecList<'t, T,> {
-    fn partial_cmp(&self, rhs: &Self) -> Option<Ordering,> {
-        for (lhs, rhs,) in self.iter().zip(rhs.iter()) {
-            match lhs.partial_cmp(rhs,) {
-                Some(Ordering::Equal) => (),
-                cmp => return cmp,
-            }
-        }
-
-        Some(Ordering::Equal)
-    }
+trait SpecExtend<A, I,> {
+  fn spec_extend(&mut self, iter: I,)
+    where I: IntoIterator<Item = A>;
 }
 
-impl<'t, T: 't + Ord,> Ord for VecList<'t, T,> {
-    fn cmp(&self, rhs: &Self) -> Ordering {
-        for (lhs, rhs,) in self.iter().zip(rhs.iter()) {
-            match lhs.cmp(rhs,) {
-                Ordering::Equal => (),
-                cmp => return cmp,
-            }
-        }
-
-        Ordering::Equal
-    }
+impl<T, A, I,> SpecExtend<A, I,> for VecList<T,>
+  where A: Into<T>, I: Iterator<Item = A>, {
+  #[inline]
+  default fn spec_extend(&mut self, iter: I,) {
+    for a in iter { self.push_back(a.into(),) }
+  }
 }
 
-impl<'t, T: 't + Debug,> Debug for VecList<'t, T,> {
-    fn fmt(&self, fmt: &mut fmt::Formatter,) -> fmt::Result {
-        fmt.debug_list().entries(self.iter()).finish()
-    }
+impl<T, A, I,> SpecExtend<A, I,> for VecList<T,>
+  where A: Into<T>, I: TrustedLen<Item = A>, {
+  fn spec_extend(&mut self, iter: I,) {
+    //Reserve additional space for the values.
+    if let Some(additional) = iter.size_hint().1 { self.reserve(additional,) }
+
+    for a in iter { self.push_back(a.into(),) }
+  }
 }
 
-impl<'t, T: 't,> Drop for VecList<'t, T,> {
-    #[inline]
-    fn drop(&mut self,) { self.clear() }
+impl<T,> Default for VecList<T,> {
+  #[inline]
+  fn default() -> Self { Self::new() }
+}
+
+impl<T,> Drop for VecList<T,> {
+  #[inline]
+  fn drop(&mut self,) { self.clear() }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_vec_list() {
+    let list = VecList::<i32>::new();
+
+    assert_eq!(list.capacity(), 0, "`VecList::new()` incorrect capacity",);
+    assert_eq!(list.len(), 0, "`VecList::new()` created with incorrect length",);
+
+    let mut list = VecList::<i32>::with_capacity(2,);
+
+    assert_eq!(list.capacity(), 2, "`VecList::with_capacity(2,)` created with incorrect capacity",);
+    assert_eq!(list.len(), 0, "`VecList::with_capacity(2,)` created with incorrect length",);
+
+    list.reserve(1,);
+    assert_eq!(list.capacity(), 2, "`VecList::reserve(1,)` incorrect capacity",);
+    list.reserve(2,);
+    assert_eq!(list.capacity(), 2, "`VecList::reserve(2,)` incorrect capacity",);
+
+    list.reserve(3,);
+    assert_eq!(list.capacity(), 4, "`VecList::reserve(3,)` incorrect capacity",);
+
+    list.reserve_exact(6,);
+    assert_eq!(list.capacity(), 10, "`VecList::reserve_exact(6,)` incorrect capacity",);
+
+    for i in 1..3 { list.push_back(i,); }
+    list.push_front(0,);
+    assert_eq!(list.len(), 3, "`VecList::push_(front/back)` did not increment the length",);
+
+    assert_eq!(list.pop_back(), Some(2), "`VecList::pop_back` returned incorrect result",);
+    assert_eq!(list.len(), 2, "`VecList::pop_front` did not decrement the length.",);
+
+    assert_eq!(list.pop_front(), Some(0), "`VecList::pop_front` returned incorrect result",);
+    assert_eq!(list.len(), 1, "`VecList::pop_back` did not decrement the length.",);
+
+    list.clear();
+    assert_eq!(list.capacity(), 10, "`VecList::clear` changed the capacity",);
+    assert_eq!(list.len(), 0, "`VecList::clear` did not empty the list",);
+  }
 }

@@ -1,3 +1,4 @@
+
 [package]
 name = "vec-list"
 version = "0.1.0"
@@ -5,3 +6,4 @@ authors = ["Dynisious <daniel.bechaz@gmail.com>"]
 
 [dependencies]
 imply_option = "*"
+testdrop = "*"
